@@ -89,6 +89,12 @@ function safeRedirect(req: express.Request): string {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
+// Root: redirect to /login
+app.get("/", (req, res) => {
+    const redirect = (req.query.redirect as string) || "https://app.avdaat.biz";
+    res.redirect("/login?redirect=" + encodeURIComponent(redirect));
+});
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 app.get("/verify", (req, res) => {
