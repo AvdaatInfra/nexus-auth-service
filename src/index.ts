@@ -3,6 +3,7 @@ import passport from "passport";
 import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
+import { neon } from "@neondatabase/serverless";
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -13,16 +14,119 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET!;
 const JWT_SECRET           = process.env.JWT_SECRET!;
 const AUTH_DOMAIN          = process.env.AUTH_DOMAIN || "auth.avdaat.biz";
 
-// Comma-separated list of allowed Gmail addresses
+// Comma-separated static allowlist — kept as a backstop for the super-owner
+// (and any other email that should bypass the DB check entirely).
+// Example: ALLOWED_EMAILS=avdaat.infra@gmail.com,shubham@gmail.com
 const ALLOWED_EMAILS = (process.env.ALLOWED_EMAILS || "")
   .split(",")
   .map((e) => e.trim().toLowerCase())
   .filter(Boolean);
 
+// Optional: shared Brain Postgres connection. If set, nexus-auth-service
+// will additionally allow any email that:
+//   1. has an active row in the shared `users` table (any Brain product
+//      already onboarded them), OR
+//   2. has a pending invite in `cr_pending_invites` (Cash Register invite
+//      flow — and any future *_pending_invites tables added below).
+//
+// If DATABASE_URL is unset, we silently fall back to the env-var allowlist
+// only — preserves the previous behaviour so this change is safe to ship
+// before the env var is wired up on Railway.
+const DATABASE_URL = process.env.DATABASE_URL;
+const sql = DATABASE_URL ? neon(DATABASE_URL) : null;
+
 if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !JWT_SECRET) {
   throw new Error(
     "Missing required env vars: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, JWT_SECRET"
   );
+}
+
+/**
+ * Decide whether a Google email is allowed to receive a nexus_token.
+ *
+ * Order of checks (any one passing is enough):
+ *   1. Static ALLOWED_EMAILS env var (super-owner backstop, never DB-dependent)
+ *   2. Active row in shared `users` table  (already-onboarded Brain user)
+ *   3. Pending invite in `cr_pending_invites` (Cash Register pre-invite)
+ *
+ * Important: any thrown DB error must NOT silently allow the request through.
+ * It also must not silently block legitimate static-allowlisted users.
+ * So we evaluate the static check first, and only on a static miss do we
+ * try the DB. A DB failure on a non-static email returns false (denied) and
+ * is logged loudly so we can spot it in Railway logs.
+ */
+async function isEmailAllowed(email: string): Promise<{
+  allowed: boolean;
+  reason: string;
+}> {
+  const lower = email.trim().toLowerCase();
+
+  // 1. Static env-var allowlist
+  if (ALLOWED_EMAILS.length > 0 && ALLOWED_EMAILS.includes(lower)) {
+    return { allowed: true, reason: "static-allowlist" };
+  }
+
+  // If no DB and no static allowlist defined → open-mode (legacy behaviour
+  // preserved: empty allowlist = allow everyone). This matches the original
+  // `if (ALLOWED_EMAILS.length > 0 && ...)` semantics.
+  if (!sql) {
+    if (ALLOWED_EMAILS.length === 0) {
+      return { allowed: true, reason: "open-mode-no-allowlist" };
+    }
+    return { allowed: false, reason: "static-allowlist-miss-no-db" };
+  }
+
+  // 2. Active row in shared users table
+  try {
+    const activeUser = (await sql`
+      SELECT 1
+      FROM users
+      WHERE LOWER(email) = ${lower}
+        AND COALESCE(is_active, true) = true
+      LIMIT 1
+    `) as Array<unknown>;
+    if (activeUser.length > 0) {
+      return { allowed: true, reason: "users-table-active" };
+    }
+  } catch (err) {
+    console.error(
+      `[auth-service] users-table lookup failed for ${lower}:`,
+      err
+    );
+    // Fall through to invite check — the invite check is the more important
+    // path for fresh invitees, and we don't want a transient `users` query
+    // failure to block them.
+  }
+
+  // 3. Pending invite in cr_pending_invites
+  // (Add UNION ALL clauses here when other Brain products grow their own
+  //  *_pending_invites tables — keep the contract: email + status='pending'.)
+  try {
+    const pendingInvite = (await sql`
+      SELECT 1
+      FROM cr_pending_invites
+      WHERE LOWER(email) = ${lower}
+        AND status = 'pending'
+      LIMIT 1
+    `) as Array<unknown>;
+    if (pendingInvite.length > 0) {
+      return { allowed: true, reason: "cr-pending-invite" };
+    }
+  } catch (err) {
+    console.error(
+      `[auth-service] cr_pending_invites lookup failed for ${lower}:`,
+      err
+    );
+    return { allowed: false, reason: "db-error" };
+  }
+
+  // If we made it here: not static-allowed, no active users row, no pending invite.
+  if (ALLOWED_EMAILS.length === 0) {
+    // Open-mode would normally accept this — but DB is wired AND nothing
+    // matched, so we treat that as a deliberate restriction.
+    return { allowed: false, reason: "no-match-db-mode" };
+  }
+  return { allowed: false, reason: "no-match" };
 }
 
 // ── Middleware ───────────────────────────────────────────────────────────────
@@ -39,20 +143,30 @@ passport.use(
       callbackURL:  `https://${AUTH_DOMAIN}/auth/google/callback`,
       scope:        ["email", "profile"],
     },
-    (_accessToken, _refreshToken, profile, done) => {
-      const email = profile.emails?.[0]?.value?.toLowerCase();
-      if (!email) return done(new Error("No email returned from Google"));
+    async (_accessToken, _refreshToken, profile, done) => {
+      try {
+        const email = profile.emails?.[0]?.value?.toLowerCase();
+        if (!email) return done(new Error("No email returned from Google"));
 
-      if (ALLOWED_EMAILS.length > 0 && !ALLOWED_EMAILS.includes(email)) {
-        return done(null, false);
+        const { allowed, reason } = await isEmailAllowed(email);
+        console.log(
+          `[auth-service] login attempt email=${email} allowed=${allowed} reason=${reason}`
+        );
+
+        if (!allowed) {
+          return done(null, false);
+        }
+
+        return done(null, {
+          email,
+          name:    profile.displayName,
+          picture: profile.photos?.[0]?.value ?? null,
+          googleId: profile.id,
+        });
+      } catch (err) {
+        console.error("[auth-service] verify callback error:", err);
+        return done(err as Error);
       }
-
-      return done(null, {
-        email,
-        name:    profile.displayName,
-        picture: profile.photos?.[0]?.value ?? null,
-        googleId: profile.id,
-      });
     }
   )
 );
@@ -175,7 +289,10 @@ app.get("/unauthorized", (_req, res) => {
 app.listen(PORT, () => {
   console.log(`[auth-service] Listening on port ${PORT}`);
   console.log(`[auth-service] Domain  : ${AUTH_DOMAIN}`);
-  console.log(`[auth-service] Allowlist (${ALLOWED_EMAILS.length} emails): ${
-    ALLOWED_EMAILS.length ? ALLOWED_EMAILS.join(", ") : "(open — no allowlist set)"
+  console.log(`[auth-service] Static allowlist (${ALLOWED_EMAILS.length} emails): ${
+    ALLOWED_EMAILS.length ? ALLOWED_EMAILS.join(", ") : "(none)"
   }`);
+  console.log(
+    `[auth-service] DB allowlist: ${sql ? "ENABLED (users.is_active + cr_pending_invites)" : "DISABLED (DATABASE_URL not set)"}`
+  );
 });
